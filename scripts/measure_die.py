@@ -95,7 +95,8 @@ def classify_colors(segs, cut=None, crease=None):
     colors = sorted(by)
     if not colors:
         raise ValueError("页面里没有带描边颜色的线段")
-    method = "参数指定"
+    confirmed = cut is not None and bool(crease)
+    method = "参数指定（颜色角色仍以人工确认依据为准）" if confirmed else "颜色未完整指定，候选推断需人工确认"
     if cut is None:
         # 推断：整体外包框最大的颜色当切线；面积相近时取更红的颜色
         def area(c):
@@ -107,14 +108,19 @@ def classify_colors(segs, cut=None, crease=None):
         cut = min(cands, key=lambda c: color_dist(c, "#ff0000"))
         method = "推断（外包框最大/偏红），需人工确认"
     else:
-        cut = min(colors, key=lambda c: color_dist(c, cut)) if cut not in by else cut
+        cut = "#" + cut.strip().lstrip("#").lower()
+        if cut not in by:
+            raise ValueError(f"指定切线颜色 {cut} 不存在；不自动替换为近似颜色")
     if crease is None:
         rest = [c for c in colors if c != cut]
         crease_set = set(rest)
     else:
         crease_set = set()
         for want in crease:
-            crease_set.add(want if want in by else min(colors, key=lambda c: color_dist(c, want)))
+            want = "#" + want.strip().lstrip("#").lower()
+            if want not in by or want == cut:
+                raise ValueError(f"指定压痕颜色 {want} 不存在或与切线相同；请核实")
+            crease_set.add(want)
         crease_set.discard(cut)
     other = [c for c in colors if c != cut and c not in crease_set]
     return {
@@ -122,6 +128,7 @@ def classify_colors(segs, cut=None, crease=None):
         "crease": sorted(crease_set),
         "other": other,
         "method": method,
+        "roles_explicit": confirmed,
         "segment_counts": {c: len(by[c]) for c in colors},
     }
 
@@ -335,14 +342,15 @@ def measure(pdf, page=0, cut=None, crease=None, scale=1.0, double_max=6.0,
         "colors": cls,
         "piece_count": len(pieces),
         "pieces": pieces,
-        "warnings": [],
+        "warnings": ([] if cls["roles_explicit"] else ["切线和压痕颜色未同时明确指定：部件和尺寸仅为候选，不用于成盒尺寸结论"]),
+        "measurement_status": "roles-specified-review-required" if cls["roles_explicit"] else "provisional",
         "verdict": "仅数据，不判定可生产；尺寸以刀模厂/师傅确认版和白样为准",
     }
     if info["curve_items_approximated"]:
         result["warnings"].append(f"有 {info['curve_items_approximated']} 段曲线按弦长近似，圆角处尺寸有偏差")
     # 出血：其他颜色线条形成比部件外扩约 bleed 的框才算画了出血线
     bleed_found = []
-    if other_segs:
+    if cls["roles_explicit"] and other_segs:
         for oc in components(other_segs):
             ob = oc["bbox"]
             for p in pieces:
@@ -350,10 +358,13 @@ def measure(pdf, page=0, cut=None, crease=None, scale=1.0, double_max=6.0,
                 off = [b[0] - ob[0], b[1] - ob[1], ob[2] - b[2], ob[3] - b[3]]
                 if all(0.5 <= o <= bleed + 2.5 for o in off):
                     bleed_found.append({"piece": p["id"], "offset_mm": [round(o, 2) for o in off]})
-    result["bleed_line"] = {"found": bool(bleed_found), "matches": bleed_found,
-                            "note": "未见出血线；设计时按默认外扩出血（含内折墙边）并标待确认" if not bleed_found else "见到外扩线框，仍需人工确认它是出血线"}
-    if not bleed_found:
-        result["warnings"].append("刀模里没有出血线")
+    result["bleed_line"] = {
+        "found": bool(bleed_found), "found_semantics": "兼容字段：仅表示候选外扩框检出，不证明出血存在或缺失", "status": "candidate" if bleed_found else "unknown",
+        "matches": bleed_found,
+        "note": ("检测到候选外扩线框，尚不能确认是出血线" if bleed_found else
+                 "未识别到候选出血线；不能据此判定未画出血，须结合图层、标注及人工核查"),
+    }
+    result["warnings"].append(result["bleed_line"]["note"])
 
     trays = [p for p in pieces if p.get("bottom_panel_mm") and p.get("wall_height_mm")]
     assembly = None
@@ -371,6 +382,7 @@ def measure(pdf, page=0, cut=None, crease=None, scale=1.0, double_max=6.0,
             "lid_bottom_mm": [lw, ll], "base_bottom_mm": [bw, bl],
             "clearance_mm": {"width": round(lw - bw, 2), "length": round(ll - bl, 2),
                              "height": round(lid["wall_height_mm"] - base["wall_height_mm"], 2)},
+            "clearance_mm_semantics": "兼容字段：width/length 是面板压痕中心尺寸差，height 是墙高差；不是装配净间隙",
             "lid_depth": "全盖（天盖墙高≈地盖墙高）" if full else "浅盖/半盖",
             "closed_outer_mm_approx": [round(ll, 1), round(lw, 1), round(height, 1)],
             "note": "成盒外尺寸按天盖底面与较高墙高近似；内尺寸要减纸厚，纸厚未知时不写死",
@@ -381,7 +393,10 @@ def measure(pdf, page=0, cut=None, crease=None, scale=1.0, double_max=6.0,
         t = trays[0]
         w, l = sorted([t["bottom_panel_mm"]["width"], t["bottom_panel_mm"]["length"]])
         assembly = {"type": "单件起墙盒/托", "closed_outer_mm_approx": [round(l, 1), round(w, 1), t["wall_height_mm"]]}
-    result["assembly"] = assembly
+    result["assembly"] = assembly if cls["roles_explicit"] else None
+    if not cls["roles_explicit"]:
+        result["assembly_candidate"] = assembly
+        assembly = None
 
     if claimed:
         want = parse_dims(claimed)
@@ -407,7 +422,8 @@ def to_markdown(r):
     c = r["colors"]
     L += [f"- 版面：{r['pdf']['page_size_mm'][0]}×{r['pdf']['page_size_mm'][1]} mm；比例系数 {r['scale']}",
           f"- 切线颜色 {c['cut']}；压痕颜色 {', '.join(c['crease']) or '无'}；其他 {', '.join(c['other']) or '无'}（{c['method']}）",
-          f"- 部件数：{r['piece_count']}；出血线：{'有' if r['bleed_line']['found'] else '没有'}", ""]
+          f"- 测量状态：{r['measurement_status']}；候选部件数：{r['piece_count']}",
+          f"- 出血线：{r['bleed_line']['note']}", ""]
     for p in r["pieces"]:
         L.append(f"## 部件 {p['id']}：展开 {p['flat_size_mm'][0]}×{p['flat_size_mm'][1]} mm，{p['structure']}")
         if p.get("bottom_panel_mm"):
@@ -424,7 +440,7 @@ def to_markdown(r):
         L.append(f"- 成盒外尺寸约 {a['closed_outer_mm_approx']} mm")
         if "clearance_mm" in a:
             cl = a["clearance_mm"]
-            L.append(f"- 天盖底 {a['lid_bottom_mm']}、地盖底 {a['base_bottom_mm']}；配合量 宽 {cl['width']} / 长 {cl['length']} / 墙高差 {cl['height']}；{a['lid_depth']}")
+            L.append(f"- 天盖底 {a['lid_bottom_mm']}、地盖底 {a['base_bottom_mm']}；面板压痕中心尺寸差（非装配净间隙）宽 {cl['width']} / 长 {cl['length']} / 墙高差 {cl['height']}；{a['lid_depth']}")
         L.append(f"- {a.get('note', '')}")
         L.append("")
     if "claimed_size_check" in r:
@@ -444,13 +460,13 @@ def main(argv=None):
     ap.add_argument("pdf")
     ap.add_argument("--page", type=int, default=0, help="页码，从 0 开始")
     ap.add_argument("--cut-color", help="切线颜色 #rrggbb；不填则推断")
-    ap.add_argument("--crease-color", action="append", help="压痕颜色 #rrggbb，可重复；不填则除切线外全部当压痕")
+    ap.add_argument("--crease-color", action="append", help="压痕颜色 #rrggbb，可重复；不填则其余颜色仅作压痕候选，成盒结论暂缓")
     ap.add_argument("--scale", type=float, default=1.0, help="图纸不是 1:1 时的放大系数")
     ap.add_argument("--double-max", type=float, default=6.0, help="两条压痕间距不大于此值视为双压痕（mm）")
     ap.add_argument("--min-piece", type=float, default=30.0, help="部件最小边长（mm），更小的切线组视为碎线/孔")
     ap.add_argument("--claimed", help="声称成品尺寸，如 200x47x235")
     ap.add_argument("--claim-tol", type=float, default=2.0)
-    ap.add_argument("--bleed", type=float, default=3.0, help="默认出血（mm），用于识别出血线")
+    ap.add_argument("--bleed", type=float, default=3.0, help="候选外扩框搜索参数（mm），不是工厂出血要求")
     ap.add_argument("--json", help="JSON 输出路径；不填打印到标准输出")
     ap.add_argument("--md", help="Markdown 报告输出路径")
     a = ap.parse_args(argv)

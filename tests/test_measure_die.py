@@ -58,7 +58,7 @@ class MeasureDie(unittest.TestCase):
 
     def test_lid_and_base(self):
         make_pdf(self.pdf)
-        r = m.measure(self.pdf)
+        r = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"])
         self.assertEqual(r["piece_count"], 2)
         self.assertEqual(r["colors"]["cut"], "#cc1a1a")
         lid, base = r["pieces"]
@@ -78,14 +78,14 @@ class MeasureDie(unittest.TestCase):
 
     def test_claimed_mismatch_and_match(self):
         make_pdf(self.pdf)
-        bad = m.measure(self.pdf, claimed="200x47x235")
+        bad = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"], claimed="200x47x235")
         self.assertFalse(bad["claimed_size_check"]["match"])
-        good = m.measure(self.pdf, claimed="245x70x55")
+        good = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"], claimed="245x70x55")
         self.assertTrue(good["claimed_size_check"]["match"])
 
     def test_bleed_and_window(self):
         make_pdf(self.pdf, bleed=3, window=(10, 30, 50, 120))
-        r = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db34d"])
+        r = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"])
         self.assertTrue(r["bleed_line"]["found"])
         holes = r["pieces"][0]["internal_cut_outlines"]
         self.assertEqual(len(holes), 1)
@@ -98,6 +98,39 @@ class MeasureDie(unittest.TestCase):
         self.assertEqual(m.main([str(self.pdf), "--json", str(out), "--claimed", "245x70x55"]), 1)  # 无出血线→提示
         self.assertTrue(out.exists())
         self.assertEqual(m.main([str(Path(self.tmp.name) / "missing.pdf")]), 2)
+
+    def test_mixed_colors_require_both_roles(self):
+        make_pdf(self.pdf, bleed=3)
+        for kwargs in ({}, {"cut": "#cc1a1a"}, {"crease": ["#4db24d"]}):
+            r = m.measure(self.pdf, claimed="245x70x55", **kwargs)
+            self.assertEqual(r["measurement_status"], "provisional")
+            self.assertFalse(r["colors"]["roles_explicit"])
+            self.assertIsNone(r["assembly"])
+            self.assertIsNone(r["claimed_size_check"]["match"])
+            self.assertEqual(r["bleed_line"]["status"], "unknown")
+            self.assertIn("不能据此判定", m.to_markdown(r))
+
+    def test_bleed_candidate_is_not_confirmation(self):
+        make_pdf(self.pdf, bleed=3)
+        r = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"])
+        self.assertEqual(r["bleed_line"]["status"], "candidate")
+        self.assertTrue(r["warnings"])
+        self.assertIn("尚不能确认", m.to_markdown(r))
+
+    def test_unmatched_or_conflicting_colors_rejected(self):
+        make_pdf(self.pdf)
+        for cut, crease in [("#ff0000", ["#4db24d"]),
+                            ("#cc1a1a", ["#00ff00"]),
+                            ("#cc1a1a", ["#cc1a1a"])]:
+            with self.assertRaises(ValueError):
+                m.measure(self.pdf, cut=cut, crease=crease)
+
+    def test_no_candidate_does_not_prove_no_bleed(self):
+        make_pdf(self.pdf)
+        r = m.measure(self.pdf, cut="#cc1a1a", crease=["#4db24d"])
+        self.assertEqual(r["bleed_line"]["status"], "unknown")
+        self.assertNotIn("刀模里没有出血线", r["warnings"])
+        self.assertIn("不能据此判定", r["bleed_line"]["note"])
 
     @unittest.skipUnless(os.environ.get("DIE_PDF"), "设置 DIE_PDF=真实刀模路径才跑")
     def test_real_file_smoke(self):
